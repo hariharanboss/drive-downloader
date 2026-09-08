@@ -1,0 +1,4 @@
+gradio>=4.19.0
+yt-dlp>=2024.8.6
+gdown>=5.1.0
+requests>=2.31.0
