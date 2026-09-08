@@ -39,9 +39,11 @@ def get_download_root() -> Path:
 def resolve_dest(subfolder: str = "", filename: str = "") -> Path:
     root = get_download_root()
     if subfolder:
-        # sanitize subfolder to avoid path traversal
+        # sanitize + block path traversal (.., absolute paths)
         safe = re.sub(r"[^\w\-./ ]", "_", subfolder).strip().strip("/")
-        root = root / safe
+        parts = [p for p in safe.split("/") if p not in ("", ".", "..")]
+        for p in parts:
+            root = root / p
     root.mkdir(parents=True, exist_ok=True)
     if filename:
         return root / Path(filename).name

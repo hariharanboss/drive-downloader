@@ -9,6 +9,7 @@ Run in Colab: open DriveDownloader.ipynb and run all cells.
 
 from __future__ import annotations
 
+import time
 import traceback
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from src.downloaders import (
     drive_storage,
     get_download_root,
     human_size,
+    is_gdrive_folder,
     list_downloads,
 )
 
@@ -148,6 +150,11 @@ input:focus, textarea:focus { border-color: #6366f1 !important;
 .footer a { color: #6366f1; text-decoration: none; }
 label { color: var(--df-text) !important; font-weight: 600 !important; }
 
+/* ---------- gradio progress overlay (both themes) ---------- */
+div[class*="progress-bar"] { border-radius: 999px !important; overflow: hidden; }
+div[class*="progress-text"], div[class*="progress-level"] { font-weight: 600 !important; }
+div[role="tablist"] { overflow-x: auto !important; scrollbar-width: thin; }
+
 /* ---------- mobile ---------- */
 @media (max-width: 640px) {
   .hero { flex-direction: column; padding: 18px 16px; }
@@ -159,13 +166,53 @@ label { color: var(--df-text) !important; font-weight: 600 !important; }
 """
 
 
+# Runs via launch(js=...) — Gradio strips <script> tags inside gr.HTML
+# (they are injected via innerHTML and never execute), so the toggle logic
+# must live here, not inline in the hero markup.
+THEME_JS = """(function(){
+  var KEY = 'drivefetch-theme';
+  function apply(t){
+    var dark = (t === 'dark');
+    try {
+      document.documentElement.classList.toggle('dark', dark);
+      if (document.body) document.body.classList.toggle('dark', dark);
+      var root = document.querySelector('.gradio-container');
+      if (root) root.classList.toggle('dark', dark);
+    } catch(e) {}
+    var el = document.getElementById('df-theme-toggle');
+    if (el) el.checked = dark;
+    try { localStorage.setItem(KEY, t); } catch(e) {}
+  }
+  var init = 'dark';
+  try {
+    init = localStorage.getItem(KEY) ||
+      (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  } catch(e) {}
+  apply(init);
+  // Gradio renders components asynchronously — delegate + re-sync.
+  document.addEventListener('change', function(e){
+    if (e.target && e.target.id === 'df-theme-toggle') {
+      apply(e.target.checked ? 'dark' : 'light');
+    }
+  });
+  var tries = 0;
+  var timer = setInterval(function(){
+    var el = document.getElementById('df-theme-toggle');
+    if (el) {
+      el.checked = document.documentElement.classList.contains('dark');
+      clearInterval(timer);
+    } else if (++tries > 40) { clearInterval(timer); }
+  }, 250);
+})();"""
+
+
 def _storage_html() -> str:
     s = drive_storage()
     total = s["total"] or 1
     pct = min(100, round(s["used"] / total * 100, 1))
     return f"""
-    <div class="storage-bar">
-      <b>📁 {s['root']}</b> &nbsp;•&nbsp; Used <b>{s['used_h']}</b> / {s['total_h']}
+    <div class="storage-bar" title="Free space on the machine running the app (Colab VM disk when in Colab)">
+      <b>📁 {s['root']}</b> &nbsp;•&nbsp; Server disk used <b>{s['used_h']}</b> / {s['total_h']}
       &nbsp;•&nbsp; Free <b>{s['free_h']}</b> &nbsp;•&nbsp; {pct}%
       <div class="meter"><div style="width:{pct}%"></div></div>
     </div>
@@ -180,19 +227,54 @@ def _err(msg: str) -> str:
     return f'<div class="result-err">❌ {msg}</div>'
 
 
-def _gr_progress_adapter(gr_progress):
+def _gr_progress_adapter(gr_progress, min_interval: float = 0.25,
+                         prefix: str = "", map_fn=None):
+    """Throttle + normalize backend progress into Gradio progress calls.
+
+    - Uses tuple form ``(done, total)`` so Gradio renders % + counts.
+    - Throttled to ~4 updates/sec (per-chunk calls would flood the queue
+      and make the bar flicker). Final 100% update always sent.
+    - Adds speed + ETA to the description so the bar is useful even
+      when restyled. Unknown totals show 0-bar + bytes/s (consistent
+      look instead of spinner/bar flip-flopping).
+    """
+    state = {"t": 0.0}
+    start = time.time()
+
     def _cb(done: int, total: int, name: str):
         try:
+            done = max(int(done or 0), 0)
+            total = int(total or 0)
+            final = bool(total and done >= total)
+            now = time.time()
+            if not final and (now - state["t"] < min_interval):
+                return
+            state["t"] = now
+            elapsed = max(now - start, 1e-6)
+            speed = done / elapsed
+            speed_h = f"{human_size(speed)}/s" if speed > 0 else "?/s"
             if total:
-                gr_progress((done / total), desc=f"{name} — {human_size(done)}/{human_size(total)}")
+                frac = min(max(done / total, 0.0), 1.0)
+                eta = (total - done) / speed if speed > 0 else 0
+                desc = (f"{prefix}{name} — {human_size(done)}/{human_size(total)} "
+                        f"({frac * 100:.0f}%, {speed_h}, ETA {eta:.0f}s)")
+                if map_fn is not None:
+                    gr_progress(map_fn(frac), desc=desc)
+                else:
+                    gr_progress((done, total), desc=desc)
             else:
-                gr_progress(None, desc=f"{name} — {human_size(done)}")
+                desc = f"{prefix}{name} — {human_size(done)} ({speed_h})"
+                if map_fn is not None:
+                    # unknown file size: advance overall bar conservatively
+                    gr_progress(map_fn(0.0), desc=desc)
+                else:
+                    gr_progress(0, desc=desc)
         except Exception:
             pass
     return _cb
 
 
-def handle_direct(url, filename, subfolder, progress=gr.Progress(track_tqdm=True)):
+def handle_direct(url, filename, subfolder, progress=gr.Progress(track_tqdm=False)):
     if not url or not url.strip():
         return _err("Paste a direct download link first."), _storage_html()
     try:
@@ -206,7 +288,7 @@ def handle_direct(url, filename, subfolder, progress=gr.Progress(track_tqdm=True
         return _err(f"Direct download failed: {e}"), _storage_html()
 
 
-def handle_youtube(url, quality, subfolder, progress=gr.Progress(track_tqdm=True)):
+def handle_youtube(url, quality, subfolder, progress=gr.Progress(track_tqdm=False)):
     if not url or not url.strip():
         return _err("Paste a YouTube / video link first."), _storage_html()
     try:
@@ -219,10 +301,14 @@ def handle_youtube(url, quality, subfolder, progress=gr.Progress(track_tqdm=True
         return _err(f"Video download failed: {e}"), _storage_html()
 
 
-def handle_gdrive(url, subfolder, progress=gr.Progress(track_tqdm=True)):
+def handle_gdrive(url, subfolder, progress=gr.Progress(track_tqdm=False)):
     if not url or not url.strip():
         return _err("Paste a Google Drive shared link first (Anyone with the link)."), _storage_html()
     try:
+        # Folder clones have no per-file hook (gdown) — show indeterminate
+        # status so the bar doesn't look stuck at 0%.
+        if is_gdrive_folder(url.strip()):
+            progress(0, desc="Cloning Drive folder — this can take a while…")
         dest = download_gdrive_shared(url, subfolder=subfolder or "",
                                       progress=_gr_progress_adapter(progress))
         if dest.is_file():
@@ -234,15 +320,22 @@ def handle_gdrive(url, subfolder, progress=gr.Progress(track_tqdm=True)):
         return _err(f"Shared-link download failed: {e}. Make sure link is public."), _storage_html()
 
 
-def handle_bulk(text, subfolder, progress=gr.Progress(track_tqdm=True)):
+def handle_bulk(text, subfolder, progress=gr.Progress(track_tqdm=False)):
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     if not lines:
         return _err("Paste one URL per line first."), _storage_html()
     results = []
-    cb = _gr_progress_adapter(progress)
+    n = len(lines)
     for i, url in enumerate(lines, 1):
+        base = (i - 1) / n
+        span = 1 / n
+        # Map this file's 0..1 fraction into its overall slice so the bar
+        # moves monotonically instead of flickering between files.
+        cb = _gr_progress_adapter(
+            progress, prefix=f"[{i}/{n}] ",
+            map_fn=lambda f, _b=base, _s=span: min(max(_b + _s * f, 0.0), 1.0))
         try:
-            progress((i - 1) / len(lines), desc=f"[{i}/{len(lines)}] {url[:60]}")
+            progress(base, desc=f"[{i}/{n}] Starting {url[:60]}")
             kind = detect_link_type(url)
             if kind == "gdrive":
                 d = download_gdrive_shared(url, subfolder=subfolder or "", progress=cb)
@@ -250,6 +343,7 @@ def handle_bulk(text, subfolder, progress=gr.Progress(track_tqdm=True)):
                 d = download_youtube(url, subfolder=subfolder or "", progress=cb)
             else:
                 d = download_direct(url, subfolder=subfolder or "", progress=cb)
+            progress(i / n, desc=f"[{i}/{n}] Done")
             results.append(f"✅ [{kind}] {Path(d).name}")
         except Exception as e:
             results.append(f"❌ {url[:70]} — {e}")
@@ -267,14 +361,15 @@ def refresh_files():
 
 
 def build_demo() -> gr.Blocks:
-    with gr.Blocks(title="DriveFetch — Save to Drive", css=CUSTOM_CSS,
-                   theme=gr.themes.Soft(primary_hue="indigo")) as demo:
+    # NOTE (Gradio 6): css/theme/js/head belong on launch(), not Blocks().
+    # Passing them to Blocks() is ignored with a deprecation warning.
+    with gr.Blocks(title="DriveFetch — Save to Drive") as demo:
         gr.HTML(f"""
         <div class="hero">
           <div class="hero-main">
             <div class="logo">DF</div>
             <div style="min-width:0">
-              <h1>{APP_TITLE}<span class="version-pill">v1.1</span></h1>
+              <h1>{APP_TITLE}<span class="version-pill">v1.2</span></h1>
               <p>{APP_SUB}. Files land directly in Drive — no Colab disk fill-ups, resumable, with live progress.</p>
               <div class="badges">
                 <span class="badge dot b-green">Direct HTTP</span>
@@ -293,30 +388,6 @@ def build_demo() -> gr.Blocks:
             <small>DARK / LIGHT</small>
           </div>
         </div>
-        <script>
-        (function() {{
-          var key = 'drivefetch-theme';
-          function apply(t) {{
-            var dark = (t === 'dark');
-            document.documentElement.classList.toggle('dark', dark);
-            if (document.body) document.body.classList.toggle('dark', dark);
-            var el = document.getElementById('df-theme-toggle');
-            if (el) el.checked = dark;
-            try {{ localStorage.setItem(key, t); }} catch(e) {{}}
-          }}
-          var init = 'dark';
-          try {{
-            init = localStorage.getItem(key) ||
-              (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
-          }} catch(e) {{}}
-          apply(init);
-          document.addEventListener('change', function(e) {{
-            if (e.target && e.target.id === 'df-theme-toggle') {{
-              apply(e.target.checked ? 'dark' : 'light');
-            }}
-          }});
-        }})();
-        </script>
         """)
 
         storage = gr.HTML(_storage_html())
@@ -379,4 +450,6 @@ demo = build_demo()
 if __name__ == "__main__":
     import os
     in_colab = os.path.exists("/content") or os.path.exists("/content/drive")
-    demo.launch(share=in_colab, server_name="0.0.0.0", server_port=7860)
+    demo.launch(share=in_colab, server_name="0.0.0.0", server_port=7860,
+                theme=gr.themes.Soft(primary_hue="indigo"),
+                css=CUSTOM_CSS, js=THEME_JS)
