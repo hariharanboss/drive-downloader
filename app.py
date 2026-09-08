@@ -154,6 +154,7 @@ label { color: var(--df-text) !important; font-weight: 600 !important; }
 
 /* ---------- bottom-docked download status (both themes) ---------- */
 .df-hidden { display: none !important; }
+.df-reserve { padding-bottom: 150px !important; } /* footer never under dock */
 .df-dock { position: fixed; left: 50%; transform: translateX(-50%); bottom: 18px;
   z-index: 200; width: min(600px, calc(100vw - 32px));
   background: var(--df-card); border: 1px solid var(--df-border);
@@ -182,6 +183,11 @@ label { color: var(--df-text) !important; font-weight: 600 !important; }
 .result-pending { background: rgba(99,102,241,.08); border: 1px solid rgba(99,102,241,.3);
   border-radius: 12px; padding: 12px 14px; font-size: 14px; color: var(--df-text); }
 div[role="tablist"] { overflow-x: auto !important; scrollbar-width: thin; }
+
+/* Reserve clearance so the footer scrolls ABOVE the fixed dock while a
+   download is active (class toggled by THEME_JS via MutationObserver). */
+.footer.df-clear { margin-bottom: 170px !important; }
+@media (max-width: 640px) { .footer.df-clear { margin-bottom: 140px !important; } }
 
 /* ---------- mobile ---------- */
 @media (max-width: 640px) {
@@ -235,6 +241,38 @@ THEME_JS = """() => {
       el.checked = document.documentElement.classList.contains('dark');
       clearInterval(timer);
     } else if (++tries > 40) { clearInterval(timer); }
+    syncDock();
+  }, 250);
+  // Keep the footer ABOVE the fixed progress dock: when #df-dock becomes
+  // visible, add clearance to .footer; when hidden, remove it. This also
+  // covers Gradio's async initial render of the dock element.
+  function syncDock(){
+    try {
+      var dock = document.getElementById('df-dock');
+      var footers = document.querySelectorAll('.footer');
+      var visible = !!(dock && !dock.classList.contains('df-hidden'));
+      for (var i = 0; i < footers.length; i++) {
+        footers[i].classList.toggle('df-clear', visible);
+      }
+    } catch(e) {}
+  }
+  var dockObs = null;
+  function watchDock(){
+    try {
+      var dock = document.getElementById('df-dock');
+      if (!dock || dockObs) return;
+      dockObs = new MutationObserver(syncDock);
+      dockObs.observe(dock, { attributes: true, attributeFilter: ['class'] });
+      syncDock();
+    } catch(e) {}
+  }
+  watchDock();
+  // Dock is rendered async by Gradio — keep retrying briefly until found.
+  var dockTries = 0;
+  var dockTimer = setInterval(function(){
+    var dock = document.getElementById('df-dock');
+    if (dock) { watchDock(); clearInterval(dockTimer); }
+    else if (++dockTries > 40) { clearInterval(dockTimer); }
   }, 250);
 }"""
 
