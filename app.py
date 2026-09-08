@@ -152,14 +152,24 @@ input:focus, textarea:focus { border-color: #6366f1 !important;
 .footer a { color: #6366f1; text-decoration: none; }
 label { color: var(--df-text) !important; font-weight: 600 !important; }
 
-/* ---------- bottom-docked download status (both themes) ---------- */
-.df-hidden { display: none !important; }
-.df-reserve { padding-bottom: 150px !important; } /* footer never under dock */
-.df-dock { position: fixed; left: 50%; transform: translateX(-50%); bottom: 18px;
-  z-index: 200; width: min(600px, calc(100vw - 32px));
+/* ---------- permanent bottom download section (always present) ---------- */
+/* The bar is ALWAYS rendered; state changes only swap its inner content.
+   No show/hide toggling => no overlap race, footer never covered.
+   Page body reserves clearance via .df-body-pad (set on the last gr.HTML). */
+.df-body-pad { height: 0; }
+.dock-wrap { position: fixed; left: 0; right: 0; bottom: 0; z-index: 200;
+  display: flex; justify-content: center; pointer-events: none; }
+.df-dock { width: min(600px, calc(100vw - 32px));
   background: var(--df-card); border: 1px solid var(--df-border);
   border-radius: 16px; box-shadow: var(--df-shadow);
-  padding: 14px 16px; color: var(--df-text); }
+  padding: 14px 16px; color: var(--df-text);
+  pointer-events: auto; }
+/* states: idle / running / done / error */
+.df-dock.df-idle { opacity: .85; }
+.df-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+  background: #94a3b8; }
+.df-dock.df-done .df-dot { background: #34d399; }
+.df-dock.df-error .df-dot { background: #f87171; }
 .df-row { display: flex; gap: 12px; align-items: center; }
 .df-spin { width: 22px; height: 22px; flex-shrink: 0; border-radius: 50%;
   border: 3px solid rgba(148,163,184,.3); border-top-color: #6366f1;
@@ -176,6 +186,8 @@ label { color: var(--df-text) !important; font-weight: 600 !important; }
   overflow: hidden; margin-top: 10px; }
 .df-fill { height: 100%; border-radius: 999px;
   background: linear-gradient(90deg,#6366f1,#22d3ee); transition: width .3s ease; }
+.df-dock.df-done .df-fill { background: linear-gradient(90deg,#34d399,#10b981); }
+.df-dock.df-error .df-fill { background: #f87171; width: 100% !important; }
 .df-track.df-ind .df-fill { width: 35% !important; animation: dfslide 1.2s ease-in-out infinite; }
 @keyframes dfslide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
 .df-sub { margin-top: 8px; font-size: 12px; color: var(--df-muted);
@@ -184,11 +196,6 @@ label { color: var(--df-text) !important; font-weight: 600 !important; }
   border-radius: 12px; padding: 12px 14px; font-size: 14px; color: var(--df-text); }
 div[role="tablist"] { overflow-x: auto !important; scrollbar-width: thin; }
 
-/* Reserve clearance so the footer scrolls ABOVE the fixed dock while a
-   download is active (class toggled by THEME_JS via MutationObserver). */
-.footer.df-clear { margin-bottom: 170px !important; }
-@media (max-width: 640px) { .footer.df-clear { margin-bottom: 140px !important; } }
-
 /* ---------- mobile ---------- */
 @media (max-width: 640px) {
   .hero { flex-direction: column; padding: 18px 16px; }
@@ -196,7 +203,8 @@ div[role="tablist"] { overflow-x: auto !important; scrollbar-width: thin; }
   .theme-box { flex-direction: row; align-self: flex-end; }
   .tabs { padding: 12px; border-radius: 14px; }
   .gr-button-primary, button.primary { width: 100% !important; }
-  .df-dock { bottom: 10px; padding: 12px; }
+  .df-dock { padding: 12px; }
+  .df-body-pad { height: 118px !important; }
 }
 """
 
@@ -241,38 +249,6 @@ THEME_JS = """() => {
       el.checked = document.documentElement.classList.contains('dark');
       clearInterval(timer);
     } else if (++tries > 40) { clearInterval(timer); }
-    syncDock();
-  }, 250);
-  // Keep the footer ABOVE the fixed progress dock: when #df-dock becomes
-  // visible, add clearance to .footer; when hidden, remove it. This also
-  // covers Gradio's async initial render of the dock element.
-  function syncDock(){
-    try {
-      var dock = document.getElementById('df-dock');
-      var footers = document.querySelectorAll('.footer');
-      var visible = !!(dock && !dock.classList.contains('df-hidden'));
-      for (var i = 0; i < footers.length; i++) {
-        footers[i].classList.toggle('df-clear', visible);
-      }
-    } catch(e) {}
-  }
-  var dockObs = null;
-  function watchDock(){
-    try {
-      var dock = document.getElementById('df-dock');
-      if (!dock || dockObs) return;
-      dockObs = new MutationObserver(syncDock);
-      dockObs.observe(dock, { attributes: true, attributeFilter: ['class'] });
-      syncDock();
-    } catch(e) {}
-  }
-  watchDock();
-  // Dock is rendered async by Gradio — keep retrying briefly until found.
-  var dockTries = 0;
-  var dockTimer = setInterval(function(){
-    var dock = document.getElementById('df-dock');
-    if (dock) { watchDock(); clearInterval(dockTimer); }
-    else if (++dockTries > 40) { clearInterval(dockTimer); }
   }, 250);
 }"""
 
@@ -330,13 +306,48 @@ class _LiveProgress:
             return (self.label, self.name, self.done, self.total, self.start)
 
 
-def _dock_hidden() -> str:
-    return '<div class="df-dock df-hidden" id="df-dock"></div>'
+def _dock_shell(state: str, title: str, fname: str, bar: str,
+                pct: str, sub: str) -> str:
+    """Permanent bottom status bar. `state` in {idle, run, done, error} —
+    the bar element ALWAYS exists; only classes/content change."""
+    icon = ('<span class="df-spin"></span>' if state == "run"
+            else '<span class="df-dot"></span>')
+    return (
+        f'<div class="dock-wrap"><div class="df-dock df-{state}" id="df-dock" '
+        f'role="status" aria-live="polite">'
+        f'<div class="df-row">{icon}'
+        f'<div class="df-meta"><div class="df-title">{title}</div>'
+        f'<div class="df-file">{fname}</div></div>'
+        f'<div class="df-pct">{pct}</div></div>'
+        f'{bar}<div class="df-sub">{sub}</div></div></div>'
+    )
+
+
+def _dock_idle() -> str:
+    return _dock_shell(
+        "idle", "No active downloads",
+        "Paste a link in any tab above to start.",
+        '<div class="df-track"><div class="df-fill" style="width:0%"></div></div>',
+        "—", "Ready")
+
+
+def _dock_done(msg: str) -> str:
+    return _dock_shell(
+        "done", "Download complete", html.escape(msg[:70]),
+        '<div class="df-track"><div class="df-fill" style="width:100%"></div></div>',
+        "100%", "Finished — see the result in the tab above")
+
+
+def _dock_error(msg: str) -> str:
+    return _dock_shell(
+        "error", "Download failed", html.escape(msg[:70]),
+        '<div class="df-track"><div class="df-fill"></div></div>',
+        "!", "Check the error in the tab above")
 
 
 def _dock_html(label: str, name: str, done: int, total: int, start: float) -> str:
-    """Bottom-docked status card. Determinate bar when total is known,
-    shimmer indeterminate bar otherwise (same card, consistent look)."""
+    """Running state. Determinate bar when total is known, shimmer bar
+    otherwise (same card, consistent look)."""
     elapsed = max(time.time() - start, 1e-6)
     speed = done / elapsed
     speed_h = f"{human_size(speed)}/s" if speed > 0 else "?/s"
@@ -354,14 +365,7 @@ def _dock_html(label: str, name: str, done: int, total: int, start: float) -> st
         bar = '<div class="df-track df-ind"><div class="df-fill"></div></div>'
         pct = "•••"
         sub = f"{human_size(done)} downloaded • {speed_h}"
-    return (
-        f'<div class="df-dock" id="df-dock" role="status" aria-live="polite">'
-        f'<div class="df-row"><span class="df-spin"></span>'
-        f'<div class="df-meta"><div class="df-title">{title}</div>'
-        f'<div class="df-file">{fname}</div></div>'
-        f'<div class="df-pct">{pct}</div></div>'
-        f'{bar}<div class="df-sub">{sub}</div></div>'
-    )
+    return _dock_shell("run", title, fname, bar, pct, sub)
 
 
 def _pending(label: str) -> str:
@@ -375,11 +379,11 @@ def _file_rows():
 
 
 def _run_with_dock(label: str, worker):
-    """Run blocking ``worker(state) -> result_html`` on a thread while
-    streaming dock updates. Yields (result, storage, dock, files) tuples.
+    """Run blocking ``worker(state) -> (result_html, done_msg)`` on a thread
+    while streaming dock updates. Yields (result, storage, dock, files).
 
-    The dock is visible for the whole download and hidden again on
-    completion; the per-tab result area + Files tab update at the end.
+    The bar is permanent: idle -> run (live updates) -> done/error, and the
+    last message stays on screen (green/red) instead of vanishing.
     """
     st = _LiveProgress(label=label)
     box: dict = {}
@@ -402,24 +406,26 @@ def _run_with_dock(label: str, worker):
         yield _pending(label), storage, _dock_html(*st.snapshot()), files
     if "error" in box:
         print(box["error"])
-        last_line = html.escape(box["error"].strip().splitlines()[-1][:300])
-        yield _err(f"Download failed: {last_line}"), _storage_html(), \
-            _dock_hidden(), _file_rows()
+        last_line = box["error"].strip().splitlines()[-1][:300]
+        yield _err(f"Download failed: {html.escape(last_line)}"), _storage_html(), \
+            _dock_error(last_line), _file_rows()
     else:
-        yield box["result"], _storage_html(), _dock_hidden(), _file_rows()
+        result, done_msg = box["result"]
+        yield result, _storage_html(), _dock_done(done_msg), _file_rows()
 
 
-def _saved_ok(dest: Path) -> str:
+def _saved_ok(dest: Path):
     size = dest.stat().st_size if dest.is_file() else 0
-    return _ok(f"Saved <span class='mono'>{html.escape(dest.name)}</span> "
-               f"({human_size(size)})<br><span class='mono'>"
-               f"{html.escape(str(dest))}</span>")
+    return (_ok(f"Saved <span class='mono'>{html.escape(dest.name)}</span> "
+                f"({human_size(size)})<br><span class='mono'>"
+                f"{html.escape(str(dest))}</span>"),
+            dest.name)
 
 
 def handle_direct(url, filename, subfolder):
     if not url or not url.strip():
         yield _err("Paste a direct download link first."), _storage_html(), \
-            _dock_hidden(), _file_rows()
+            _dock_idle(), _file_rows()
         return
     label = f"Downloading {(filename or url).strip()[:60]}"
 
@@ -434,7 +440,7 @@ def handle_direct(url, filename, subfolder):
 def handle_youtube(url, quality, subfolder):
     if not url or not url.strip():
         yield _err("Paste a YouTube / video link first."), _storage_html(), \
-            _dock_hidden(), _file_rows()
+            _dock_idle(), _file_rows()
         return
     label = f"Downloading video {url.strip()[:60]}"
 
@@ -449,7 +455,7 @@ def handle_youtube(url, quality, subfolder):
 def handle_gdrive(url, subfolder):
     if not url or not url.strip():
         yield _err("Paste a Google Drive shared link first (Anyone with the link)."), \
-            _storage_html(), _dock_hidden(), _file_rows()
+            _storage_html(), _dock_idle(), _file_rows()
         return
     folder = is_gdrive_folder(url.strip())
     label = ("Cloning Drive folder" if folder else
@@ -462,8 +468,9 @@ def handle_gdrive(url, subfolder):
                                       progress=st.cb)
         if dest.is_file():
             return _saved_ok(dest)
-        return _ok(f"Folder saved: <span class='mono'>"
-                   f"{html.escape(str(dest))}</span>")
+        return (_ok(f"Folder saved: <span class='mono'>"
+                    f"{html.escape(str(dest))}</span>"),
+                f"Folder → {dest.name}")
 
     yield from _run_with_dock(label, worker)
 
@@ -472,7 +479,7 @@ def handle_bulk(text, subfolder):
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     if not lines:
         yield _err("Paste one URL per line first."), _storage_html(), \
-            _dock_hidden(), _file_rows()
+            _dock_idle(), _file_rows()
         return
     n = len(lines)
 
@@ -497,7 +504,8 @@ def handle_bulk(text, subfolder):
                                f"{html.escape(str(e)[:200])}")
         ok_count = sum(1 for r in results if r.startswith("✅"))
         return (f'<div class="result-ok">{ok_count}/{n} done<br>'
-                f'{"<br>".join(results)}</div>')
+                f'{"<br>".join(results)}</div>',
+                f"{ok_count}/{n} links done")
 
     yield from _run_with_dock(f"Batch download ({n} links)", worker)
 
@@ -519,7 +527,7 @@ def build_demo() -> gr.Blocks:
           <div class="hero-main">
             <div class="logo">DF</div>
             <div style="min-width:0">
-              <h1>{APP_TITLE}<span class="version-pill">v1.3</span></h1>
+              <h1>{APP_TITLE}<span class="version-pill">v1.4</span></h1>
               <p>{APP_SUB}. Files land directly in Drive — no Colab disk fill-ups, resumable, with live progress.</p>
               <div class="badges">
                 <span class="badge dot b-green">Direct HTTP</span>
@@ -588,9 +596,11 @@ def build_demo() -> gr.Blocks:
                     f_btn.click(refresh_files, None, [f_table, storage])
                     demo.load(refresh_files, None, [f_table, storage])
 
-        # Persistent bottom-docked status: hidden until a download starts.
+        # Permanent bottom status section: spacer (scroll clearance) + bar.
+        # The bar NEVER unmounts — states: idle -> run -> done/error.
         # Every download streams (result, storage, dock, files) tuples.
-        dock = gr.HTML(_dock_hidden())
+        spacer = gr.HTML('<div class="df-body-pad" style="height:150px"></div>')
+        dock = gr.HTML(_dock_idle())
         d_btn.click(handle_direct, [d_url, d_name, d_folder],
                     [d_out, storage, dock, f_table])
         y_btn.click(handle_youtube, [y_url, y_q, y_folder],
