@@ -297,13 +297,20 @@ def download_gdrive_shared(
 
 
 def detect_link_type(url: str) -> str:
-    u = url.lower()
-    if "drive.google.com" in u or "/folders/" in u:
+    low = url.lower()
+    try:
+        host = urllib.parse.urlparse(low).netloc.split("@")[-1].split(":")[0]
+    except Exception:
+        host = ""
+
+    def _dom(*names: str) -> bool:
+        return any(host == n or host.endswith("." + n) for n in names)
+
+    if _dom("drive.google.com") or "/folders/" in low:
         return "gdrive"
-    if any(d in u for d in ["youtube.com", "youtu.be", "tiktok.com",
-                            "instagram.com", "twitter.com", "x.com",
-                            "facebook.com", "twitch.tv", "vimeo.com",
-                            "soundcloud.com", "reddit.com"]):
+    if _dom("youtube.com", "youtu.be", "tiktok.com", "instagram.com",
+            "twitter.com", "x.com", "facebook.com", "twitch.tv",
+            "vimeo.com", "soundcloud.com", "reddit.com"):
         return "youtube"
     return "direct"
 

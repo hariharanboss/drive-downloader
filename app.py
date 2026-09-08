@@ -9,6 +9,8 @@ Run in Colab: open DriveDownloader.ipynb and run all cells.
 
 from __future__ import annotations
 
+import html
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -150,9 +152,35 @@ input:focus, textarea:focus { border-color: #6366f1 !important;
 .footer a { color: #6366f1; text-decoration: none; }
 label { color: var(--df-text) !important; font-weight: 600 !important; }
 
-/* ---------- gradio progress overlay (both themes) ---------- */
-div[class*="progress-bar"] { border-radius: 999px !important; overflow: hidden; }
-div[class*="progress-text"], div[class*="progress-level"] { font-weight: 600 !important; }
+/* ---------- bottom-docked download status (both themes) ---------- */
+.df-hidden { display: none !important; }
+.df-dock { position: fixed; left: 50%; transform: translateX(-50%); bottom: 18px;
+  z-index: 200; width: min(600px, calc(100vw - 32px));
+  background: var(--df-card); border: 1px solid var(--df-border);
+  border-radius: 16px; box-shadow: var(--df-shadow);
+  padding: 14px 16px; color: var(--df-text); }
+.df-row { display: flex; gap: 12px; align-items: center; }
+.df-spin { width: 22px; height: 22px; flex-shrink: 0; border-radius: 50%;
+  border: 3px solid rgba(148,163,184,.3); border-top-color: #6366f1;
+  animation: dfspin .8s linear infinite; }
+@keyframes dfspin { to { transform: rotate(360deg); } }
+.df-meta { flex: 1; min-width: 0; }
+.df-title { font-weight: 700; font-size: 13.5px; }
+.df-file { font-family: 'JetBrains Mono', monospace; font-size: 12px;
+  color: var(--df-muted); white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; }
+.df-pct { font-weight: 800; font-size: 15px; font-variant-numeric: tabular-nums;
+  flex-shrink: 0; }
+.df-track { height: 10px; border-radius: 999px; background: rgba(148,163,184,.22);
+  overflow: hidden; margin-top: 10px; }
+.df-fill { height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg,#6366f1,#22d3ee); transition: width .3s ease; }
+.df-track.df-ind .df-fill { width: 35% !important; animation: dfslide 1.2s ease-in-out infinite; }
+@keyframes dfslide { 0% { margin-left: -35%; } 100% { margin-left: 100%; } }
+.df-sub { margin-top: 8px; font-size: 12px; color: var(--df-muted);
+  font-variant-numeric: tabular-nums; }
+.result-pending { background: rgba(99,102,241,.08); border: 1px solid rgba(99,102,241,.3);
+  border-radius: 12px; padding: 12px 14px; font-size: 14px; color: var(--df-text); }
 div[role="tablist"] { overflow-x: auto !important; scrollbar-width: thin; }
 
 /* ---------- mobile ---------- */
@@ -162,6 +190,7 @@ div[role="tablist"] { overflow-x: auto !important; scrollbar-width: thin; }
   .theme-box { flex-direction: row; align-self: flex-end; }
   .tabs { padding: 12px; border-radius: 14px; }
   .gr-button-primary, button.primary { width: 100% !important; }
+  .df-dock { bottom: 10px; padding: 12px; }
 }
 """
 
@@ -169,7 +198,11 @@ div[role="tablist"] { overflow-x: auto !important; scrollbar-width: thin; }
 # Runs via launch(js=...) — Gradio strips <script> tags inside gr.HTML
 # (they are injected via innerHTML and never execute), so the toggle logic
 # must live here, not inline in the hero markup.
-THEME_JS = """(function(){
+# CONTRACT (matches Gradio's own apps, e.g. themes/builder_app.py):
+# `js` must be a zero-arg arrow FUNCTION string. The shell evals it and
+# calls the result on load. An IIFE statement evals to `undefined`, so the
+# shell's call throws on every page load — that was the load-time error.
+THEME_JS = """() => {
   var KEY = 'drivefetch-theme';
   function apply(t){
     var dark = (t === 'dark');
@@ -203,7 +236,7 @@ THEME_JS = """(function(){
       clearInterval(timer);
     } else if (++tries > 40) { clearInterval(timer); }
   }, 250);
-})();"""
+}"""
 
 
 def _storage_html() -> str:
@@ -227,129 +260,208 @@ def _err(msg: str) -> str:
     return f'<div class="result-err">❌ {msg}</div>'
 
 
-def _gr_progress_adapter(gr_progress, min_interval: float = 0.25,
-                         prefix: str = "", map_fn=None):
-    """Throttle + normalize backend progress into Gradio progress calls.
+class _LiveProgress:
+    """Thread-safe progress state.
 
-    - Uses tuple form ``(done, total)`` so Gradio renders % + counts.
-    - Throttled to ~4 updates/sec (per-chunk calls would flood the queue
-      and make the bar flicker). Final 100% update always sent.
-    - Adds speed + ETA to the description so the bar is useful even
-      when restyled. Unknown totals show 0-bar + bytes/s (consistent
-      look instead of spinner/bar flip-flopping).
+    Download backends write via ``cb`` from a worker thread; the handler
+    generator polls ``snapshot()`` ~3x/sec and re-renders the bottom dock.
+    Cheap attribute writes (no Gradio queue flooding, no flicker).
     """
-    state = {"t": 0.0}
-    start = time.time()
 
-    def _cb(done: int, total: int, name: str):
+    def __init__(self, label: str = ""):
+        self._lock = threading.Lock()
+        self.label = label
+        self.name = ""
+        self.done = 0
+        self.total = 0
+        self.start = time.time()
+
+    def set_label(self, label: str):
+        with self._lock:
+            self.label = label
+
+    def cb(self, done: int, total: int, name: str):
+        with self._lock:
+            self.done = max(int(done or 0), 0)
+            self.total = int(total or 0)
+            if name:
+                self.name = name
+
+    def snapshot(self):
+        with self._lock:
+            return (self.label, self.name, self.done, self.total, self.start)
+
+
+def _dock_hidden() -> str:
+    return '<div class="df-dock df-hidden" id="df-dock"></div>'
+
+
+def _dock_html(label: str, name: str, done: int, total: int, start: float) -> str:
+    """Bottom-docked status card. Determinate bar when total is known,
+    shimmer indeterminate bar otherwise (same card, consistent look)."""
+    elapsed = max(time.time() - start, 1e-6)
+    speed = done / elapsed
+    speed_h = f"{human_size(speed)}/s" if speed > 0 else "?/s"
+    title = html.escape((label or "Downloading").strip()[:80])
+    fname = html.escape((name or "starting…")[:80])
+    if total:
+        frac = min(max(done / total, 0.0), 1.0)
+        eta = (total - done) / speed if speed > 0 else 0
+        bar = (f'<div class="df-track"><div class="df-fill" '
+               f'style="width:{frac * 100:.1f}%"></div></div>')
+        pct = f"{frac * 100:.0f}%"
+        sub = (f"{human_size(done)} / {human_size(total)} • {speed_h} • "
+               f"ETA {eta:.0f}s")
+    else:
+        bar = '<div class="df-track df-ind"><div class="df-fill"></div></div>'
+        pct = "•••"
+        sub = f"{human_size(done)} downloaded • {speed_h}"
+    return (
+        f'<div class="df-dock" id="df-dock" role="status" aria-live="polite">'
+        f'<div class="df-row"><span class="df-spin"></span>'
+        f'<div class="df-meta"><div class="df-title">{title}</div>'
+        f'<div class="df-file">{fname}</div></div>'
+        f'<div class="df-pct">{pct}</div></div>'
+        f'{bar}<div class="df-sub">{sub}</div></div>'
+    )
+
+
+def _pending(label: str) -> str:
+    return (f'<div class="result-pending">⏳ {html.escape(label[:100])} — '
+            f'watch the status bar at the bottom of the page…</div>')
+
+
+def _file_rows():
+    rows = list_downloads()
+    return [[r["name"], r["size_h"]] for r in rows]
+
+
+def _run_with_dock(label: str, worker):
+    """Run blocking ``worker(state) -> result_html`` on a thread while
+    streaming dock updates. Yields (result, storage, dock, files) tuples.
+
+    The dock is visible for the whole download and hidden again on
+    completion; the per-tab result area + Files tab update at the end.
+    """
+    st = _LiveProgress(label=label)
+    box: dict = {}
+    storage = _storage_html()
+    files = _file_rows()
+
+    def run():
         try:
-            done = max(int(done or 0), 0)
-            total = int(total or 0)
-            final = bool(total and done >= total)
-            now = time.time()
-            if not final and (now - state["t"] < min_interval):
-                return
-            state["t"] = now
-            elapsed = max(now - start, 1e-6)
-            speed = done / elapsed
-            speed_h = f"{human_size(speed)}/s" if speed > 0 else "?/s"
-            if total:
-                frac = min(max(done / total, 0.0), 1.0)
-                eta = (total - done) / speed if speed > 0 else 0
-                desc = (f"{prefix}{name} — {human_size(done)}/{human_size(total)} "
-                        f"({frac * 100:.0f}%, {speed_h}, ETA {eta:.0f}s)")
-                if map_fn is not None:
-                    gr_progress(map_fn(frac), desc=desc)
-                else:
-                    gr_progress((done, total), desc=desc)
-            else:
-                desc = f"{prefix}{name} — {human_size(done)} ({speed_h})"
-                if map_fn is not None:
-                    # unknown file size: advance overall bar conservatively
-                    gr_progress(map_fn(0.0), desc=desc)
-                else:
-                    gr_progress(0, desc=desc)
+            box["result"] = worker(st)
         except Exception:
-            pass
-    return _cb
+            box["error"] = traceback.format_exc(limit=3)
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    yield _pending(label), storage, _dock_html(*st.snapshot()), files
+    while True:
+        t.join(timeout=0.3)
+        if not t.is_alive():
+            break
+        yield _pending(label), storage, _dock_html(*st.snapshot()), files
+    if "error" in box:
+        print(box["error"])
+        last_line = html.escape(box["error"].strip().splitlines()[-1][:300])
+        yield _err(f"Download failed: {last_line}"), _storage_html(), \
+            _dock_hidden(), _file_rows()
+    else:
+        yield box["result"], _storage_html(), _dock_hidden(), _file_rows()
 
 
-def handle_direct(url, filename, subfolder, progress=gr.Progress(track_tqdm=False)):
+def _saved_ok(dest: Path) -> str:
+    size = dest.stat().st_size if dest.is_file() else 0
+    return _ok(f"Saved <span class='mono'>{html.escape(dest.name)}</span> "
+               f"({human_size(size)})<br><span class='mono'>"
+               f"{html.escape(str(dest))}</span>")
+
+
+def handle_direct(url, filename, subfolder):
     if not url or not url.strip():
-        return _err("Paste a direct download link first."), _storage_html()
-    try:
+        yield _err("Paste a direct download link first."), _storage_html(), \
+            _dock_hidden(), _file_rows()
+        return
+    label = f"Downloading {(filename or url).strip()[:60]}"
+
+    def worker(st: _LiveProgress):
         dest = download_direct(url, custom_filename=filename or "",
-                               subfolder=subfolder or "",
-                               progress=_gr_progress_adapter(progress))
-        size = dest.stat().st_size if dest.is_file() else 0
-        return _ok(f"Saved <span class='mono'>{dest.name}</span> ({human_size(size)})<br><span class='mono'>{dest}</span>"), _storage_html()
-    except Exception as e:
-        traceback.print_exc()
-        return _err(f"Direct download failed: {e}"), _storage_html()
+                               subfolder=subfolder or "", progress=st.cb)
+        return _saved_ok(dest)
+
+    yield from _run_with_dock(label, worker)
 
 
-def handle_youtube(url, quality, subfolder, progress=gr.Progress(track_tqdm=False)):
+def handle_youtube(url, quality, subfolder):
     if not url or not url.strip():
-        return _err("Paste a YouTube / video link first."), _storage_html()
-    try:
+        yield _err("Paste a YouTube / video link first."), _storage_html(), \
+            _dock_hidden(), _file_rows()
+        return
+    label = f"Downloading video {url.strip()[:60]}"
+
+    def worker(st: _LiveProgress):
         dest = download_youtube(url, quality=quality, subfolder=subfolder or "",
-                                progress=_gr_progress_adapter(progress))
-        size = dest.stat().st_size if dest.is_file() else 0
-        return _ok(f"Saved <span class='mono'>{dest.name}</span> ({human_size(size)})<br><span class='mono'>{dest}</span>"), _storage_html()
-    except Exception as e:
-        traceback.print_exc()
-        return _err(f"Video download failed: {e}"), _storage_html()
+                                progress=st.cb)
+        return _saved_ok(dest)
+
+    yield from _run_with_dock(label, worker)
 
 
-def handle_gdrive(url, subfolder, progress=gr.Progress(track_tqdm=False)):
+def handle_gdrive(url, subfolder):
     if not url or not url.strip():
-        return _err("Paste a Google Drive shared link first (Anyone with the link)."), _storage_html()
-    try:
-        # Folder clones have no per-file hook (gdown) — show indeterminate
-        # status so the bar doesn't look stuck at 0%.
-        if is_gdrive_folder(url.strip()):
-            progress(0, desc="Cloning Drive folder — this can take a while…")
+        yield _err("Paste a Google Drive shared link first (Anyone with the link)."), \
+            _storage_html(), _dock_hidden(), _file_rows()
+        return
+    folder = is_gdrive_folder(url.strip())
+    label = ("Cloning Drive folder" if folder else
+             f"Saving shared file {url.strip()[:60]}")
+
+    def worker(st: _LiveProgress):
+        if folder:
+            st.cb(0, 0, "Drive folder (no per-file progress)")
         dest = download_gdrive_shared(url, subfolder=subfolder or "",
-                                      progress=_gr_progress_adapter(progress))
+                                      progress=st.cb)
         if dest.is_file():
-            size = dest.stat().st_size
-            return _ok(f"Saved <span class='mono'>{dest.name}</span> ({human_size(size)})<br><span class='mono'>{dest}</span>"), _storage_html()
-        return _ok(f"Folder saved: <span class='mono'>{dest}</span>"), _storage_html()
-    except Exception as e:
-        traceback.print_exc()
-        return _err(f"Shared-link download failed: {e}. Make sure link is public."), _storage_html()
+            return _saved_ok(dest)
+        return _ok(f"Folder saved: <span class='mono'>"
+                   f"{html.escape(str(dest))}</span>")
+
+    yield from _run_with_dock(label, worker)
 
 
-def handle_bulk(text, subfolder, progress=gr.Progress(track_tqdm=False)):
+def handle_bulk(text, subfolder):
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
     if not lines:
-        return _err("Paste one URL per line first."), _storage_html()
-    results = []
+        yield _err("Paste one URL per line first."), _storage_html(), \
+            _dock_hidden(), _file_rows()
+        return
     n = len(lines)
-    for i, url in enumerate(lines, 1):
-        base = (i - 1) / n
-        span = 1 / n
-        # Map this file's 0..1 fraction into its overall slice so the bar
-        # moves monotonically instead of flickering between files.
-        cb = _gr_progress_adapter(
-            progress, prefix=f"[{i}/{n}] ",
-            map_fn=lambda f, _b=base, _s=span: min(max(_b + _s * f, 0.0), 1.0))
-        try:
-            progress(base, desc=f"[{i}/{n}] Starting {url[:60]}")
+
+    def worker(st: _LiveProgress):
+        results = []
+        for i, url in enumerate(lines, 1):
+            st.set_label(f"[{i}/{n}] {url[:50]}")
             kind = detect_link_type(url)
-            if kind == "gdrive":
-                d = download_gdrive_shared(url, subfolder=subfolder or "", progress=cb)
-            elif kind == "youtube":
-                d = download_youtube(url, subfolder=subfolder or "", progress=cb)
-            else:
-                d = download_direct(url, subfolder=subfolder or "", progress=cb)
-            progress(i / n, desc=f"[{i}/{n}] Done")
-            results.append(f"✅ [{kind}] {Path(d).name}")
-        except Exception as e:
-            results.append(f"❌ {url[:70]} — {e}")
-    html = "<br>".join(results)
-    ok_count = sum(1 for r in results if r.startswith("✅"))
-    return f'<div class="result-ok">{ok_count}/{len(lines)} done<br>{html}</div>', _storage_html()
+            try:
+                if kind == "gdrive":
+                    d = download_gdrive_shared(url, subfolder=subfolder or "",
+                                               progress=st.cb)
+                elif kind == "youtube":
+                    d = download_youtube(url, subfolder=subfolder or "",
+                                         progress=st.cb)
+                else:
+                    d = download_direct(url, subfolder=subfolder or "",
+                                        progress=st.cb)
+                results.append(f"✅ [{kind}] {html.escape(Path(d).name)}")
+            except Exception as e:
+                results.append(f"❌ {html.escape(url[:70])} — "
+                               f"{html.escape(str(e)[:200])}")
+        ok_count = sum(1 for r in results if r.startswith("✅"))
+        return (f'<div class="result-ok">{ok_count}/{n} done<br>'
+                f'{"<br>".join(results)}</div>')
+
+    yield from _run_with_dock(f"Batch download ({n} links)", worker)
 
 
 def refresh_files():
@@ -369,7 +481,7 @@ def build_demo() -> gr.Blocks:
           <div class="hero-main">
             <div class="logo">DF</div>
             <div style="min-width:0">
-              <h1>{APP_TITLE}<span class="version-pill">v1.2</span></h1>
+              <h1>{APP_TITLE}<span class="version-pill">v1.3</span></h1>
               <p>{APP_SUB}. Files land directly in Drive — no Colab disk fill-ups, resumable, with live progress.</p>
               <div class="badges">
                 <span class="badge dot b-green">Direct HTTP</span>
@@ -392,6 +504,8 @@ def build_demo() -> gr.Blocks:
 
         storage = gr.HTML(_storage_html())
 
+        # Components are created here; event wiring happens after the dock
+        # exists (all outputs must exist before .click() references them).
         with gr.Group(elem_classes=["tabs"]):
             with gr.Tabs():
                 with gr.Tab("🔗 Direct Link"):
@@ -402,7 +516,6 @@ def build_demo() -> gr.Blocks:
                         d_folder = gr.Textbox(label="Subfolder in Downloads (optional)", placeholder="movies / software")
                     d_btn = gr.Button("⬇ Download to Drive", variant="primary")
                     d_out = gr.HTML()
-                    d_btn.click(handle_direct, [d_url, d_name, d_folder], [d_out, storage])
 
                 with gr.Tab("▶ YouTube / Video"):
                     gr.Markdown("YouTube, TikTok, Instagram, X, Facebook, Twitch, Vimeo + 1000 sites via yt-dlp.")
@@ -413,7 +526,6 @@ def build_demo() -> gr.Blocks:
                         y_folder = gr.Textbox(label="Subfolder (optional)", placeholder="videos")
                     y_btn = gr.Button("⬇ Download Video", variant="primary")
                     y_out = gr.HTML()
-                    y_btn.click(handle_youtube, [y_url, y_q, y_folder], [y_out, storage])
 
                 with gr.Tab("📁 Drive Shared Link"):
                     gr.Markdown("Paste a **Anyone with the link** Google Drive file/folder link. Folders are cloned recursively.")
@@ -421,7 +533,6 @@ def build_demo() -> gr.Blocks:
                     g_folder = gr.Textbox(label="Subfolder (optional)", placeholder="shared")
                     g_btn = gr.Button("⬇ Save to My Drive", variant="primary")
                     g_out = gr.HTML()
-                    g_btn.click(handle_gdrive, [g_url, g_folder], [g_out, storage])
 
                 with gr.Tab("⚡ Bulk"):
                     gr.Markdown("One URL per line. Auto-detects Direct / Video / Drive links.")
@@ -430,7 +541,6 @@ def build_demo() -> gr.Blocks:
                     b_folder = gr.Textbox(label="Subfolder (optional)", placeholder="batch-01")
                     b_btn = gr.Button("⬇ Download All", variant="primary")
                     b_out = gr.HTML()
-                    b_btn.click(handle_bulk, [b_text, b_folder], [b_out, storage])
 
                 with gr.Tab("📂 Files"):
                     gr.Markdown(f"Contents of `{get_download_root()}` (newest first).")
@@ -439,6 +549,18 @@ def build_demo() -> gr.Blocks:
                                            interactive=False, wrap=True)
                     f_btn.click(refresh_files, None, [f_table, storage])
                     demo.load(refresh_files, None, [f_table, storage])
+
+        # Persistent bottom-docked status: hidden until a download starts.
+        # Every download streams (result, storage, dock, files) tuples.
+        dock = gr.HTML(_dock_hidden())
+        d_btn.click(handle_direct, [d_url, d_name, d_folder],
+                    [d_out, storage, dock, f_table])
+        y_btn.click(handle_youtube, [y_url, y_q, y_folder],
+                    [y_out, storage, dock, f_table])
+        g_btn.click(handle_gdrive, [g_url, g_folder],
+                    [g_out, storage, dock, f_table])
+        b_btn.click(handle_bulk, [b_text, b_folder],
+                    [b_out, storage, dock, f_table])
 
         gr.HTML('<div class="footer">DriveFetch • Colab + Local • yt-dlp • gdown • Gradio &nbsp;—&nbsp; only download content you have rights to.</div>')
 
